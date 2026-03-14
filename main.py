@@ -1,11 +1,9 @@
-import os
-import json
 import firebase_admin
 from firebase_admin import credentials, auth, db
 from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 import time
 import httpx
 import math
@@ -14,14 +12,7 @@ from datetime import datetime, timedelta, timezone
 # ---------------------------------------------------------
 # 1. SETUP & INITIALIZATION
 # ---------------------------------------------------------
-
-firebase_keys_str = os.environ.get('FIREBASE_SERVICE_ACCOUNT')
-
-if firebase_keys_str:
-    cred_dict = json.loads(firebase_keys_str)
-    cred = credentials.Certificate(cred_dict)
-else:
-    cred = credentials.Certificate("serviceAccountKey.json")
+cred = credentials.Certificate("serviceAccountKey.json")
 
 if not firebase_admin._apps:
     firebase_admin.initialize_app(cred, {
@@ -38,10 +29,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- ADD THIS SO YOU DON'T GET A 404 ERROR ---
-@app.get("/")
-async def root():
-    return {"status": "success", "message": "Poultry Backend is Live and Running!"}
 # ---------------------------------------------------------
 # 2. UTILITY: PHILIPPINE TIME
 # ---------------------------------------------------------
@@ -289,59 +276,76 @@ def generate_weight_forecast(start_weight: float, population: int, feed_forecast
                 })
     return weight_data
 
+VITAMIN_CATEGORIES = {
+    "Electrolytes":           ["electrolyte", "elyte", "lyte"],
+    "Biotin/Niacin/Riboflavin": ["biotin", "niacin", "riboflavin", "b-complex", "b complex", "vitamin b", "vit b"],
+    "Multi V / Multivi Plus": ["multi", "multivi", "multivitamin", "mv ", " mv", "vitamins", "multivit", "multi v"],
+    "Vit ADE":                ["ade", "vit ade", "vitamin ade", "a d e"],
+}
+
+def classify_vitamin(item_name: str) -> str:
+    """Map an expense item name to one of the 5 vitamin categories."""
+    name_lower = item_name.lower()
+    for category, keywords in VITAMIN_CATEGORIES.items():
+        if any(kw in name_lower for kw in keywords):
+            return category
+    return "Others"
+
 def calculate_vitamin_trends(batches: list):
-    """Calculate vitamin usage trends from historical batches"""
-    vitamin_data = {}
-    
+    """Calculate vitamin usage trends from historical batches, grouped by category."""
+    # category → list of {date, population, amount, rate_per_bird}
+    category_data: Dict[str, list] = {}
+
     sorted_batches = sorted(batches, key=lambda x: x.get('dateCreated', ''))
-    
+
     for batch in sorted_batches:
         batch_date = batch.get('dateCreated', '')
-        batch_pop = batch.get('startingPopulation', 1000)
-        batch_vitamins = {}
-        
+        batch_pop  = max(batch.get('startingPopulation', 1000), 1)
+        category_totals: Dict[str, float] = {}
+
         if batch.get('expenses'):
-            for exp_id, exp in batch.get('expenses').items():
-                if exp.get('category') in ['Vitamins', 'Medications']:
-                    vitamin_name = exp.get('itemName', 'Others')
-                    quantity = float(exp.get('quantity', 0)) * float(exp.get('purchaseCount', 1))
-                    
-                    if vitamin_name not in batch_vitamins:
-                        batch_vitamins[vitamin_name] = 0
-                    batch_vitamins[vitamin_name] += quantity
-        
-        for vit_name, amount in batch_vitamins.items():
-            if vit_name not in vitamin_data:
-                vitamin_data[vit_name] = []
-            
-            rate_per_bird = amount / batch_pop
-            vitamin_data[vit_name].append({
-                "date": batch_date,
-                "population": batch_pop,
-                "amount": amount,
-                "rate_per_bird": rate_per_bird
+            for exp in batch['expenses'].values():
+                if exp.get('category') not in ('Vitamins', 'Medications'):
+                    continue
+                item_name = exp.get('itemName', 'Others')
+                cat       = classify_vitamin(item_name)
+                quantity  = float(exp.get('quantity', 0)) * float(exp.get('purchaseCount', 1))
+                category_totals[cat] = category_totals.get(cat, 0.0) + quantity
+
+        for cat, amount in category_totals.items():
+            if cat not in category_data:
+                category_data[cat] = []
+            category_data[cat].append({
+                "date":         batch_date,
+                "batchName":    batch.get('batchName', ''),
+                "population":   batch_pop,
+                "amount":       round(amount, 3),
+                "rate_per_bird": round(amount / batch_pop, 5),
             })
-    
+
     trends = {}
-    for vit_name, data in vitamin_data.items():
-        if len(data) >= 2:
-            first_rate = data[0]["rate_per_bird"]
-            last_rate = data[-1]["rate_per_bird"]
-            avg_rate = sum(d["rate_per_bird"] for d in data) / len(data)
-            
-            if first_rate > 0:
-                trend_pct = ((last_rate - first_rate) / first_rate) * 100
-            else:
-                trend_pct = 0
-            
-            trends[vit_name] = {
-                "historical": data,
-                "avg_rate_per_bird": avg_rate,
-                "trend_percentage": round(trend_pct, 1),
-                "trend_direction": "up" if trend_pct > 5 else "down" if trend_pct < -5 else "stable",
-                "confidence": "high" if len(data) >= 3 else "medium" if len(data) >= 2 else "low"
-            }
-    
+    for cat, data in category_data.items():
+        rates = [d["rate_per_bird"] for d in data]
+        avg_rate  = sum(rates) / len(rates)
+        first_rate = rates[0]
+        last_rate  = rates[-1]
+        trend_pct  = ((last_rate - first_rate) / first_rate * 100) if first_rate > 0 else 0
+
+        # Weighted average: more recent batches count twice
+        weighted_sum   = sum(r * (i + 1) for i, r in enumerate(rates))
+        weight_total   = sum(range(1, len(rates) + 1))
+        weighted_rate  = weighted_sum / weight_total if weight_total else avg_rate
+
+        trends[cat] = {
+            "historical":        data,
+            "avg_rate_per_bird": round(avg_rate, 5),
+            "weighted_rate_per_bird": round(weighted_rate, 5),   # recommended for next forecast
+            "trend_percentage":  round(trend_pct, 1),
+            "trend_direction":   "up" if trend_pct > 5 else "down" if trend_pct < -5 else "stable",
+            "confidence":        "high" if len(data) >= 3 else "medium" if len(data) >= 2 else "low",
+            "data_points":       len(data),
+        }
+
     return trends
 
 def deactivate_other_active_batches(current_batch_id=None):
@@ -830,45 +834,190 @@ async def get_sales(batch_id: str, authorization: str = Header(None)):
 
 @app.get("/get-vitamin-forecast/{batch_id}")
 async def get_vitamin_forecast(batch_id: str, authorization: str = Header(None)):
+    """
+    Returns a rich vitamin forecast for the given batch based on the
+    weighted average consumption rates from ALL completed batches.
+
+    Response shape
+    --------------
+    {
+      batchName, population, currentDay, daysRemaining,
+      hasHistoricalData: bool,
+      dataSourceBatches: int,           # how many completed batches were used
+      categories: {
+        "<Category>": {
+          unit, dosagePerBird,          # weighted-avg rate from history
+          totalNeeded,                  # dosagePerBird * population
+          alreadyUsed,                  # from current batch vitamin_logs
+          purchased,                    # from current batch expenses
+          remaining,                    # purchased - alreadyUsed
+          stillNeeded,                  # max(0, totalNeeded - purchased)
+          status,                       # good | warning | critical | excess
+          message,
+          confidence,                   # low | medium | high
+          trendDirection,               # up | stable | down
+          trendPct,
+          historicalBreakdown: [...],   # per completed batch
+          dailyProjection: [...],       # per remaining day of current batch
+        }
+      },
+      nextBatchPlanner: {
+        "<Category>": { dosagePerBird, estimatedFor1000: float }
+      },
+      generated: int
+    }
+    """
     try:
         token = authorization.split("Bearer ")[1]
         auth.verify_id_token(token)
-        
-        batch_ref = db.reference(f'global_batches/{batch_id}')
+
+        batch_ref  = db.reference(f'global_batches/{batch_id}')
         batch_data = batch_ref.get()
-        
         if not batch_data:
             raise HTTPException(status_code=404, detail="Batch not found")
-        
-        all_batches_ref = db.reference('global_batches')
-        all_batches = all_batches_ref.get()
-        
-        completed_batches = []
-        if all_batches:
-            for bid, bdata in all_batches.items():
-                if isinstance(bdata, dict) and bdata.get('status') == 'completed':
-                    completed_batches.append(bdata)
-        
+
+        all_batches = db.reference('global_batches').get() or {}
+
+        # ── 1. Collect completed batches ──────────────────────────────────────
+        completed_batches = [
+            bdata for bid, bdata in all_batches.items()
+            if isinstance(bdata, dict) and bdata.get('status') == 'completed'
+        ]
         trends = calculate_vitamin_trends(completed_batches)
-        
-        if not trends:
-            return {
-                "batchName": batch_data.get('batchName'),
-                "population": batch_data.get('startingPopulation', 1000),
-                "forecast": [],
-                "trends": {},
-                "message": "No historical vitamin data available",
-                "generated": get_ph_time()
-            }
-        
-        return {
-            "batchName": batch_data.get('batchName'),
-            "population": batch_data.get('startingPopulation', 1000),
-            "forecast": [],  
-            "trends": trends,
-            "generated": get_ph_time()
+
+        # ── 2. Current batch metrics ──────────────────────────────────────────
+        population   = max(batch_data.get('startingPopulation', 1000), 1)
+        date_created = batch_data.get('dateCreated', '')
+        today_str    = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+
+        current_day      = 1
+        days_remaining   = 30
+        if date_created:
+            try:
+                start    = datetime.strptime(date_created, '%Y-%m-%d')
+                delta    = (datetime.now() - start).days + 1
+                current_day    = max(1, min(delta, 30))
+                days_remaining = max(0, 30 - current_day)
+            except Exception:
+                pass
+
+        # ── 3. What has already been purchased & used in this batch ──────────
+        purchased_by_cat: Dict[str, float] = {}
+        if batch_data.get('expenses'):
+            for exp in batch_data['expenses'].values():
+                if exp.get('category') not in ('Vitamins', 'Medications'):
+                    continue
+                cat = classify_vitamin(exp.get('itemName', 'Others'))
+                qty = float(exp.get('quantity', 0)) * float(exp.get('purchaseCount', 1))
+                purchased_by_cat[cat] = purchased_by_cat.get(cat, 0.0) + qty
+
+        used_by_cat: Dict[str, float] = {}
+        if batch_data.get('vitamin_logs'):
+            for pen_logs in batch_data['vitamin_logs'].values():
+                for log in pen_logs.values():
+                    if log.get('status') == 'approved':
+                        cat = classify_vitamin(log.get('vitaminName', 'Others'))
+                        amt = float(log.get('am', 0)) + float(log.get('pm', 0))
+                        used_by_cat[cat] = used_by_cat.get(cat, 0.0) + amt
+
+        # ── 4. Build per-category forecast ───────────────────────────────────
+        all_categories = set(trends.keys()) | set(purchased_by_cat.keys()) | {"Electrolytes", "Multi V / Multivi Plus", "Vit ADE", "Biotin/Niacin/Riboflavin"}
+
+        DEFAULT_RATES = {
+            "Electrolytes":             0.050,
+            "Biotin/Niacin/Riboflavin": 0.030,
+            "Multi V / Multivi Plus":   0.100,
+            "Vit ADE":                  0.070,
+            "Others":                   0.040,
         }
-        
+        UNIT_MAP = {
+            "Multi V / Multivi Plus": "ml",
+            "Vit ADE": "ml",
+        }
+
+        categories_out: Dict[str, Any] = {}
+        next_batch_planner: Dict[str, Any] = {}
+
+        for cat in all_categories:
+            trend_info   = trends.get(cat, {})
+            # Prefer weighted (recent-biased) rate; fall back to avg; then default
+            dosage_per_bird = (
+                trend_info.get('weighted_rate_per_bird')
+                or trend_info.get('avg_rate_per_bird')
+                or DEFAULT_RATES.get(cat, 0.04)
+            )
+            unit         = UNIT_MAP.get(cat, 'g')
+            total_needed = round(dosage_per_bird * population, 2)
+            purchased    = round(purchased_by_cat.get(cat, 0.0), 2)
+            used         = round(used_by_cat.get(cat, 0.0), 2)
+            remaining    = round(max(0.0, purchased - used), 2)
+            still_needed = round(max(0.0, total_needed - purchased), 2)
+
+            # Status
+            if purchased == 0 and total_needed > 0:
+                status  = "critical"
+                message = f"NOT PURCHASED: Need {total_needed:.1f} {unit} for this batch"
+            elif remaining < (total_needed * 0.15):
+                status  = "critical"
+                message = f"CRITICAL LOW: Only {remaining:.1f} {unit} left"
+            elif remaining < (total_needed * 0.30):
+                status  = "warning"
+                message = f"Low Stock: {remaining:.1f} {unit} left — order soon"
+            elif remaining >= total_needed:
+                status  = "excess"
+                message = f"Surplus: {remaining:.1f} {unit} in stock"
+            else:
+                status  = "good"
+                message = f"Stock OK: {remaining:.1f} {unit} left"
+
+            # Daily projection for the remaining days
+            daily_dose   = dosage_per_bird * population / 30.0
+            daily_projection = []
+            running_stock = remaining
+            for d in range(current_day + 1, 31):
+                running_stock -= daily_dose
+                daily_projection.append({
+                    "day":        d,
+                    "projected":  round(max(0, running_stock), 2),
+                    "daily_dose": round(daily_dose, 2),
+                })
+
+            categories_out[cat] = {
+                "unit":               unit,
+                "dosagePerBird":      round(dosage_per_bird, 5),
+                "totalNeeded":        total_needed,
+                "alreadyUsed":        used,
+                "purchased":          purchased,
+                "remaining":          remaining,
+                "stillNeeded":        still_needed,
+                "status":             status,
+                "message":            message,
+                "confidence":         trend_info.get('confidence', 'low') if trend_info else 'low',
+                "trendDirection":     trend_info.get('trend_direction', 'stable'),
+                "trendPct":           trend_info.get('trend_percentage', 0),
+                "dataPoints":         trend_info.get('data_points', 0),
+                "historicalBreakdown": trend_info.get('historical', []),
+                "dailyProjection":    daily_projection,
+            }
+
+            next_batch_planner[cat] = {
+                "unit":              unit,
+                "dosagePerBird":     round(dosage_per_bird, 5),
+                "estimatedFor1000":  round(dosage_per_bird * 1000, 2),
+            }
+
+        return {
+            "batchName":           batch_data.get('batchName'),
+            "population":          population,
+            "currentDay":          current_day,
+            "daysRemaining":       days_remaining,
+            "hasHistoricalData":   len(completed_batches) > 0,
+            "dataSourceBatches":   len(completed_batches),
+            "categories":          categories_out,
+            "nextBatchPlanner":    next_batch_planner,
+            "generated":           get_ph_time(),
+        }
+
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
