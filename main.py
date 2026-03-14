@@ -1,3 +1,5 @@
+import os
+import json
 import firebase_admin
 from firebase_admin import credentials, auth, db
 from fastapi import FastAPI, HTTPException, Header
@@ -12,7 +14,17 @@ from datetime import datetime, timedelta, timezone
 # ---------------------------------------------------------
 # 1. SETUP & INITIALIZATION
 # ---------------------------------------------------------
-cred = credentials.Certificate("serviceAccountKey.json")
+
+# Try to read the credentials from Render's Environment Variables first
+firebase_keys_str = os.environ.get('FIREBASE_SERVICE_ACCOUNT')
+
+if firebase_keys_str:
+    # If it finds the environment variable (meaning it's on Render), use it
+    cred_dict = json.loads(firebase_keys_str)
+    cred = credentials.Certificate(cred_dict)
+else:
+    # If it doesn't find it (meaning it's on your local laptop), use the file
+    cred = credentials.Certificate("serviceAccountKey.json")
 
 if not firebase_admin._apps:
     firebase_admin.initialize_app(cred, {
