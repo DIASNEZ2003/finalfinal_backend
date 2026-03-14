@@ -15,15 +15,12 @@ from datetime import datetime, timedelta, timezone
 # 1. SETUP & INITIALIZATION
 # ---------------------------------------------------------
 
-# Try to read the credentials from Render's Environment Variables first
 firebase_keys_str = os.environ.get('FIREBASE_SERVICE_ACCOUNT')
 
 if firebase_keys_str:
-    # If it finds the environment variable (meaning it's on Render), use it
     cred_dict = json.loads(firebase_keys_str)
     cred = credentials.Certificate(cred_dict)
 else:
-    # If it doesn't find it (meaning it's on your local laptop), use the file
     cred = credentials.Certificate("serviceAccountKey.json")
 
 if not firebase_admin._apps:
@@ -41,6 +38,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# --- ADD THIS SO YOU DON'T GET A 404 ERROR ---
+@app.get("/")
+async def root():
+    return {"status": "success", "message": "Poultry Backend is Live and Running!"}
 # ---------------------------------------------------------
 # 2. UTILITY: PHILIPPINE TIME
 # ---------------------------------------------------------
