@@ -415,19 +415,24 @@ async def verify_login(authorization: str = Header(None)):
         raise HTTPException(status_code=401, detail="Unauthorized")
     token = authorization.split("Bearer ")[1]
     try:
-        decoded_token = auth.verify_id_token(token)
+        decoded_token = auth.verify_id_token(token, check_revoked=False)
         uid = decoded_token['uid']
         user_data = db.reference(f'users/{uid}').get()
-        if not user_data or user_data.get("role") != "admin":
-            raise HTTPException(status_code=403, detail="Access denied")
+        if not user_data:
+            raise HTTPException(status_code=403, detail="User record not found. Please register first.")
+        if user_data.get("role") != "admin":
+            raise HTTPException(status_code=403, detail="Access denied. Your role is not admin.")
         return {"status": "success", "user": user_data}
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=401, detail="Invalid session")
+        print(f"VERIFY LOGIN ERROR: {type(e).__name__}: {str(e)}")
+        raise HTTPException(status_code=401, detail=f"Token verification failed: {str(e)}")
 
 @app.post("/admin-create-user")
 async def admin_create_user(data: UserRegisterSchema, authorization: str = Header(None)):
     try:
-        email = f"{data.username}@poultry.com"
+        email = f"{data.username}@example.com"
         user_record = auth.create_user(email=email, password=data.password, display_name=data.username)
         user_ref = db.reference(f'users/{user_record.uid}')
         user_ref.set({
